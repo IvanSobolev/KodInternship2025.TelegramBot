@@ -34,7 +34,7 @@ tasks: Dict[str, Task] = {}
 user_tasks: Dict[int, List[str]] = {}
 
 # Bot configuration
-TOKEN = "8078799067:AAH7rQdsGTAgCg5JGF3nLtpkgyRKlGr3aJ4"
+TOKEN = ""
 
 # Kafka configuration
 KAFKA_BOOTSTRAP_SERVERS = "150.241.88.0:29092"
@@ -86,7 +86,7 @@ def get_main_menu():
     return markup
 
 # Функция для регистрации пользователя через API
-def register_worker(telegram_id, first_name, last_name=None):
+def register_worker(telegram_id, first_name, last_name=None, department_id=1):
     try:
         # Формируем URL API для добавления работника
         url = f"{API_BASE_URL}/workers"
@@ -95,7 +95,7 @@ def register_worker(telegram_id, first_name, last_name=None):
         worker_data = {
             "telegramId": telegram_id,
             "fullName": first_name + (f" {last_name}" if last_name else ""),
-            "department": 0 
+            "department": department_id  # Используем переданный отдел вместо 0
         }
         
         headers = {
@@ -108,10 +108,14 @@ def register_worker(telegram_id, first_name, last_name=None):
         
         # Проверяем результат
         if response.status_code in [200, 201]:
-            logger.info(f"Пользователь успешно зарегистрирован: {telegram_id}")
+            logger.info(f"Пользователь успешно зарегистрирован: {telegram_id}, отдел: {department_id}")
             return True
         elif response.status_code == 500 and "уже существует" in response.text.lower():
             logger.info(f"Пользователь уже зарегистрирован: {telegram_id}")
+            # Обновляем отдел пользователя, если он уже существует
+            update_result = update_worker_department(telegram_id, department_id)
+            if update_result:
+                logger.info(f"Отдел пользователя {telegram_id} обновлен до {department_id}")
             return True
         else:
             logger.error(f"Ошибка регистрации пользователя {telegram_id}: {response.status_code} - {response.text}")
@@ -218,36 +222,39 @@ def start(message):
     username = message.from_user.username
     user_id = message.from_user.id
     
-    # Логирование ID пользователя для добавления в RecipientTelegramIds
+    # Логирование ID пользователя
     logger.info(f"Новый пользователь: {user_first_name}, Telegram ID: {user_id}")
     
-    # Регистрируем пользователя в системе
-    registration_result = register_worker(user_id, user_first_name, user_last_name)
-    
-    # Создаем красивое приветствие
+    # Создаем приветствие с просьбой выбрать отдел
     welcome_text = f"""
 🤖 *Привет, {user_first_name}!* 
 
-Я бот для отслеживания задач. Используй кнопки ниже для навигации:
-
-• *📋 Доступные задачи* - просмотр всех доступных задач
-• *🔍 Мои задачи* - просмотр задач, назначенных на вас
-• *ℹ️ Помощь* - информация о боте
+Я бот для отслеживания задач. Для начала работы выберите ваш отдел.
 
 🆔 Ваш Telegram ID: `{user_id}`
 """
-
-    if registration_result:
-        welcome_text += "✅ *Вы успешно зарегистрированы в системе!*"
-    else:
-        welcome_text += "⚠️ *Не удалось выполнить регистрацию. Попробуйте позже или обратитесь к администратору.*"
     
-    # Отправляем сообщение с меню
+    # Отправляем сообщение с приветствием
     bot.send_message(
         message.chat.id, 
         welcome_text,
+        parse_mode="Markdown"
+    )
+    
+    # Отправляем запрос на выбор отдела
+    select_department_message = "📋 *Выберите ваш отдел:*"
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("Frontend", callback_data="register_dept_1"),
+        types.InlineKeyboardButton("Backend", callback_data="register_dept_2"),
+        types.InlineKeyboardButton("UI/UX", callback_data="register_dept_3")
+    )
+    
+    bot.send_message(
+        message.chat.id,
+        select_department_message,
         parse_mode="Markdown",
-        reply_markup=get_main_menu()
+        reply_markup=markup
     )
 
 # Функция для получения доступных задач пользователя
@@ -715,187 +722,232 @@ def help_command(message):
 @bot.callback_query_handler(func=lambda call: True)
 def button_handler(call):
     """Handle button presses."""
-    user_id = call.from_user.id
-    username = call.from_user.username
-    
-    # Обработка задач из API
-    if call.data.startswith("complete_api_"):
-        task_id = call.data.split("_", 2)[2]
-        success, message = complete_task(task_id)
+    try:
+        # Извлекаем информацию из callback_data
+        callback_data = call.data
+        user_id = call.from_user.id
+        user_first_name = call.from_user.first_name
+        user_last_name = call.from_user.last_name
         
-        if success:
-            # Синхронизируем статус с API
-            try:
-                sync_task_status(task_id, user_id)
-            except Exception as e:
-                logger.error(f"Ошибка синхронизации статуса: {e}")
+        # Проверяем, если это запрос на регистрацию с выбором отдела
+        if callback_data.startswith("register_dept_"):
+            department_id = int(callback_data.split("_")[-1])
+            department_name = get_department_name(department_id)
             
-            # Теперь статус должен быть "На ревью" (status code 2)
-            status_info = get_task_status_from_code(2)
-            status_text = status_info["text"]
-            status_emoji = status_info["emoji"]
+            # Регистрируем пользователя в системе с выбранным отделом
+            registration_result = register_worker(user_id, user_first_name, user_last_name, department_id)
             
-            # Обновляем сообщение с новым статусом
-            new_text = call.message.text.split("\n\n🏷️ Статус")[0] + f"\n\n🏷️ Статус: *{status_emoji} {status_text}*\n👤 Назначена на вас"
-            
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=new_text,
-                parse_mode="Markdown"
-            )
-            
-            bot.answer_callback_query(
-                call.id, 
-                text="📝 Задача отправлена на ревью!", 
-                show_alert=True
-            )
-        else:
-            # Ограничиваем длину сообщения об ошибке до 200 символов
-            error_text = f"❌ Ошибка: {message}"
-            if len(error_text) > 200:
-                error_text = error_text[:197] + "..."
+            if registration_result:
+                # Отправляем подтверждение
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text=f"✅ *Вы успешно зарегистрированы!*\n\nВаш отдел: *{department_name}*",
+                    parse_mode="Markdown"
+                )
                 
-            bot.answer_callback_query(
-                call.id, 
-                text=error_text, 
-                show_alert=True
-            )
-        return
-    
-    # Обработка локальных задач
-    elif call.data.startswith("take_") or call.data.startswith("complete_") or call.data.startswith("review_"):
-        action = call.data.split("_", 1)[0]
-        task_id = call.data.split("_", 1)[1]
-        
-        if task_id not in tasks:
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text="❌ *Задача не найдена*\n\nЗадача была удалена или недоступна.",
-                parse_mode="Markdown"
-            )
+                # Отправляем главное меню
+                bot.send_message(
+                    call.message.chat.id,
+                    "Используйте кнопки ниже для навигации:\n\n• *📋 Доступные задачи* - просмотр всех доступных задач\n• *🔍 Мои задачи* - просмотр задач, назначенных на вас\n• *ℹ️ Помощь* - информация о боте",
+                    parse_mode="Markdown",
+                    reply_markup=get_main_menu()
+                )
+            else:
+                # Сообщение об ошибке
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text="❌ *Ошибка регистрации*\n\nНе удалось зарегистрироваться. Пожалуйста, попробуйте позже или обратитесь к администратору.",
+                    parse_mode="Markdown"
+                )
+                
+                # Предлагаем попробовать снова
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                markup.add(
+                    types.InlineKeyboardButton("Frontend", callback_data="register_dept_1"),
+                    types.InlineKeyboardButton("Backend", callback_data="register_dept_2"),
+                    types.InlineKeyboardButton("UI/UX", callback_data="register_dept_3")
+                )
+                
+                bot.send_message(
+                    call.message.chat.id,
+                    "📋 *Попробуйте выбрать отдел снова:*",
+                    parse_mode="Markdown",
+                    reply_markup=markup
+                )
+            
             return
-        
-        task = tasks[task_id]
-        
-        if action == "take":
-            # Проверяем, не назначена ли уже задача
-            if task.assigned_to is not None:
-                # Задача уже назначена
-                assigned_user_name = "другому пользователю"
-                try:
-                    url = f"{API_BASE_URL}/workers/{task.assigned_to}"
-                    response = requests.get(url)
-                    if response.status_code == 200:
-                        worker_data = response.json()
-                        assigned_user_name = worker_data.get("fullName", f"пользователю ID:{task.assigned_to}")
-                except Exception as e:
-                    logger.error(f"Ошибка при получении данных пользователя {task.assigned_to}: {e}")
-                
-                # Уведомление для пользователя, что задача уже занята
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=f"❌ *Задача уже назначена*\n\nЭта задача уже назначена на {assigned_user_name}.",
-                    parse_mode="Markdown"
-                )
-                bot.answer_callback_query(
-                    call.id, 
-                    text=f"Задача уже назначена на {assigned_user_name}.", 
-                    show_alert=True
-                )
-                return
             
-            # Проверяем, есть ли у пользователя уже взятые задачи
-            api_task = get_user_active_tasks(user_id)
-            has_active_tasks_in_api = api_task is not None
+        # Проверяем, является ли это выбором отдела для существующего пользователя
+        elif callback_data.startswith("select_dept_"):
+            department_id = int(callback_data.split("_")[-1])
+            department_name = get_department_name(department_id)
             
-            has_active_tasks_locally = False
-            if user_id in user_tasks and user_tasks[user_id]:
-                for existing_task_id in user_tasks[user_id]:
-                    if existing_task_id in tasks:
-                        existing_task = tasks[existing_task_id]
-                        if not existing_task.completed:
-                            has_active_tasks_locally = True
-                            break
-            
-            # Если у пользователя уже есть активная задача, не разрешаем взять новую
-            if has_active_tasks_in_api or has_active_tasks_locally:
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text="❌ *Нельзя взять несколько задач*\n\nУ вас уже есть активная задача. Завершите текущую задачу перед тем, как взять новую.",
-                    parse_mode="Markdown"
-                )
-                bot.answer_callback_query(
-                    call.id, 
-                    text="Нельзя взять несколько задач. Завершите текущую задачу сначала.", 
-                    show_alert=True
-                )
-                return
-            
-            # Пытаемся принять задачу через API
-            success, result = accept_task(user_id, task_id)
+            # Обновляем отдел пользователя
+            success = update_worker_department(user_id, department_id)
             
             if success:
-                # API успешно назначил задачу
-                logger.info(f"Задача {task_id} назначена пользователю {user_id} через API")
+                # Отправляем подтверждение
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text=f"✅ *Отдел успешно выбран*\n\nВаш отдел: *{department_name}*",
+                    parse_mode="Markdown"
+                )
                 
-                # Обновляем локальные данные
-                if user_id not in user_tasks:
-                    user_tasks[user_id] = []
-                if task_id not in user_tasks[user_id]:
-                    user_tasks[user_id].append(task_id)
-                    
-                # После принятия задачи, обновляем её статус через API
-                sync_task_status(task_id, user_id)
+                # Отправляем главное меню
+                bot.send_message(
+                    call.message.chat.id,
+                    "Теперь вы можете использовать основные функции бота:",
+                    reply_markup=get_main_menu()
+                )
             else:
-                # API не доступен или вернул ошибку
-                # Проверяем, не взята ли задача кем-то еще пока мы ожидали ответа API
+                # Сообщение об ошибке
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text="❌ *Ошибка при выборе отдела*\n\nПожалуйста, попробуйте позже или обратитесь к администратору.",
+                    parse_mode="Markdown"
+                )
+                
+                # Отправляем главное меню
+                bot.send_message(
+                    call.message.chat.id,
+                    "Вы можете использовать основные функции бота:",
+                    reply_markup=get_main_menu()
+                )
+            
+            return
+        
+        # Проверяем, есть ли префикс в callback_data
+        if "_" in callback_data:
+            action, task_id = callback_data.split("_", 1)
+            
+            # Находим задачу в памяти
+            if task_id not in tasks:
+                bot.answer_callback_query(call.id, text="Задача не найдена или устарела. Перезагрузите список задач.", show_alert=True)
+                return
+            
+            task = tasks[task_id]
+            
+            if action == "take":
+                # Проверяем, не назначена ли уже задача
                 if task.assigned_to is not None:
+                    # Задача уже назначена
+                    assigned_user_name = "другому пользователю"
+                    try:
+                        url = f"{API_BASE_URL}/workers/{task.assigned_to}"
+                        response = requests.get(url)
+                        if response.status_code == 200:
+                            worker_data = response.json()
+                            assigned_user_name = worker_data.get("fullName", f"пользователю ID:{task.assigned_to}")
+                    except Exception as e:
+                        logger.error(f"Ошибка при получении данных пользователя {task.assigned_to}: {e}")
+                    
+                    # Уведомление для пользователя, что задача уже занята
                     bot.edit_message_text(
                         chat_id=call.message.chat.id,
                         message_id=call.message.message_id,
-                        text="❌ *Задача уже назначена*\n\nЭта задача была только что назначена другому пользователю.",
+                        text=f"❌ *Задача уже назначена*\n\nЭта задача уже назначена на {assigned_user_name}.",
                         parse_mode="Markdown"
                     )
-                    bot.answer_callback_query(call.id, text="Задача уже назначена.")
+                    bot.answer_callback_query(
+                        call.id, 
+                        text=f"Задача уже назначена на {assigned_user_name}.", 
+                        show_alert=True
+                    )
                     return
                 
-                # Назначаем локально
-                task.assigned_to = user_id
-                if user_id not in user_tasks:
-                    user_tasks[user_id] = []
-                user_tasks[user_id].append(task_id)
-            
-            # Обновляем отображение задачи у всех пользователей
-            update_task_for_all_users(task_id, assigned_to=user_id)
-            
-            # Получаем актуальный статус задачи после назначения
-            task_status_code = 1  # По умолчанию "В процессе"
-            
-            # Пытаемся получить актуальный статус из API
-            try:
-                url = f"{API_BASE_URL}/ProjectTask/status/{task_id}"
-                response = requests.get(url)
-                if response.status_code == 200:
-                    status_data = response.json()
-                    task_status_code = status_data.get('status', 1)
-            except Exception as e:
-                logger.error(f"Ошибка получения статуса задачи после назначения: {e}")
-            
-            # Получаем статус по коду
-            status_info = get_task_status_from_code(task_status_code)
-            
-            # Показываем обновленную карточку задачи пользователю, который взял задачу
-            markup = types.InlineKeyboardMarkup(row_width=1)
-            
-            # Если задача не на ревью и не завершена, показываем кнопку завершения
-            if not status_info["is_review"] and not status_info["is_completed"]:
-                markup.add(types.InlineKeyboardButton("✅ Завершить задачу", callback_data=f"complete_{task.task_id}"))
-            
-            task_card = f"""
+                # Проверяем, есть ли у пользователя уже взятые задачи
+                api_task = get_user_active_tasks(user_id)
+                has_active_tasks_in_api = api_task is not None
+                
+                has_active_tasks_locally = False
+                if user_id in user_tasks and user_tasks[user_id]:
+                    for existing_task_id in user_tasks[user_id]:
+                        if existing_task_id in tasks:
+                            existing_task = tasks[existing_task_id]
+                            if not existing_task.completed:
+                                has_active_tasks_locally = True
+                                break
+                
+                # Если у пользователя уже есть активная задача, не разрешаем взять новую
+                if has_active_tasks_in_api or has_active_tasks_locally:
+                    bot.edit_message_text(
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id,
+                        text="❌ *Нельзя взять несколько задач*\n\nУ вас уже есть активная задача. Завершите текущую задачу перед тем, как взять новую.",
+                        parse_mode="Markdown"
+                    )
+                    bot.answer_callback_query(
+                        call.id, 
+                        text="Нельзя взять несколько задач. Завершите текущую задачу сначала.", 
+                        show_alert=True
+                    )
+                    return
+                
+                # Пытаемся принять задачу через API
+                success, result = accept_task(user_id, task_id)
+                
+                if success:
+                    # API успешно назначил задачу
+                    logger.info(f"Задача {task_id} назначена пользователю {user_id} через API")
+                    
+                    # Обновляем локальные данные
+                    if user_id not in user_tasks:
+                        user_tasks[user_id] = []
+                    if task_id not in user_tasks[user_id]:
+                        user_tasks[user_id].append(task_id)
+                        
+                    # После принятия задачи, обновляем её статус через API
+                    sync_task_status(task_id, user_id)
+                else:
+                    # API не доступен или вернул ошибку
+                    # Проверяем, не взята ли задача кем-то еще пока мы ожидали ответа API
+                    if task.assigned_to is not None:
+                        bot.edit_message_text(
+                            chat_id=call.message.chat.id,
+                            message_id=call.message.message_id,
+                            text="❌ *Задача уже назначена*\n\nЭта задача была только что назначена другому пользователю.",
+                            parse_mode="Markdown"
+                        )
+                        bot.answer_callback_query(call.id, text="Задача уже назначена.")
+                        return
+                    
+                    # Назначаем локально
+                    task.assigned_to = user_id
+                    if user_id not in user_tasks:
+                        user_tasks[user_id] = []
+                    user_tasks[user_id].append(task_id)
+                
+                # Обновляем отображение задачи у всех пользователей
+                update_task_for_all_users(task_id, assigned_to=user_id)
+                
+                # Получаем актуальный статус задачи после назначения
+                task_status_code = 1  # По умолчанию "В процессе"
+                
+                # Пытаемся получить актуальный статус из API
+                try:
+                    url = f"{API_BASE_URL}/ProjectTask/status/{task_id}"
+                    response = requests.get(url)
+                    if response.status_code == 200:
+                        status_data = response.json()
+                        task_status_code = status_data.get('status', 1)
+                except Exception as e:
+                    logger.error(f"Ошибка получения статуса задачи после назначения: {e}")
+                
+                # Получаем статус по коду
+                status_info = get_task_status_from_code(task_status_code)
+                
+                # Показываем обновленную карточку задачи пользователю, который взял задачу
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                
+                # Если задача не на ревью и не завершена, показываем кнопку завершения
+                if not status_info["is_review"] and not status_info["is_completed"]:
+                    markup.add(types.InlineKeyboardButton("✅ Завершить задачу", callback_data=f"complete_{task.task_id}"))
+                
+                task_card = f"""
 🔹 *{task.title}*
 {task.text}
 
@@ -903,60 +955,60 @@ def button_handler(call):
 🏷️ Статус: *{status_info["emoji"]} {status_info["text"]}*
 👤 Назначена на вас
 """
-            
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=task_card,
-                reply_markup=markup if markup.keyboard else None,
-                parse_mode="Markdown"
-            )
-            
-            # Отправим уведомление об успешном взятии задачи
-            bot.answer_callback_query(
-                call.id, 
-                text="✅ Вы успешно взяли задачу на выполнение!", 
-                show_alert=True
-            )
-            
-        elif action == "complete":
-            # Проверяем, назначена ли задача текущему пользователю
-            if task.assigned_to != user_id:
+                
                 bot.edit_message_text(
                     chat_id=call.message.chat.id,
                     message_id=call.message.message_id,
-                    text="❌ *Ошибка*\n\nВы не можете завершить эту задачу, так как она не назначена на вас.",
+                    text=task_card,
+                    reply_markup=markup if markup.keyboard else None,
                     parse_mode="Markdown"
                 )
-                bot.answer_callback_query(call.id, text="Задача не назначена на вас.")
-                return
-            
-            # Пытаемся завершить задачу через API
-            success, message_text = complete_task(task_id)
-            
-            if success:
-                # Синхронизируем статус с API
-                try:
-                    sync_task_status(task_id, user_id)
-                except Exception as e:
-                    logger.error(f"Ошибка синхронизации статуса: {e}")
+                
+                # Отправим уведомление об успешном взятии задачи
+                bot.answer_callback_query(
+                    call.id, 
+                    text="✅ Вы успешно взяли задачу на выполнение!", 
+                    show_alert=True
+                )
+                
+            elif action == "complete":
+                # Проверяем, назначена ли задача текущему пользователю
+                if task.assigned_to != user_id:
+                    bot.edit_message_text(
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id,
+                        text="❌ *Ошибка*\n\nВы не можете завершить эту задачу, так как она не назначена на вас.",
+                        parse_mode="Markdown"
+                    )
+                    bot.answer_callback_query(call.id, text="Задача не назначена на вас.")
+                    return
+                
+                # Пытаемся завершить задачу через API
+                success, message_text = complete_task(task_id)
+                
+                if success:
+                    # Синхронизируем статус с API
+                    try:
+                        sync_task_status(task_id, user_id)
+                    except Exception as e:
+                        logger.error(f"Ошибка синхронизации статуса: {e}")
+                        
+                    # Всегда отмечаем задачу как отправленную на ревью, вне зависимости от предыдущего состояния
+                    task.completed = False
+                    task.in_review = True
                     
-                # Всегда отмечаем задачу как отправленную на ревью, вне зависимости от предыдущего состояния
-                task.completed = False
-                task.in_review = True
-                
-                # Получаем статус "На ревью" (код 2)
-                status_info = get_task_status_from_code(2)
-                status_text = status_info["text"]
-                status_emoji = status_info["emoji"]
-                
-                notification_text = "📝 Задача отправлена на ревью!"
-                
-                # Обновляем отображение задачи у всех пользователей
-                update_task_for_all_users(task_id, in_review=True, completed=False)
-                
-                # Показываем обновленную карточку задачи пользователю
-                task_card = f"""
+                    # Получаем статус "На ревью" (код 2)
+                    status_info = get_task_status_from_code(2)
+                    status_text = status_info["text"]
+                    status_emoji = status_info["emoji"]
+                    
+                    notification_text = "📝 Задача отправлена на ревью!"
+                    
+                    # Обновляем отображение задачи у всех пользователей
+                    update_task_for_all_users(task_id, in_review=True, completed=False)
+                    
+                    # Показываем обновленную карточку задачи пользователю
+                    task_card = f"""
 🔹 *{task.title}*
 {task.text}
 
@@ -964,68 +1016,68 @@ def button_handler(call):
 🏷️ Статус: *{status_emoji} {status_text}*
 👤 Назначена на вас
 """
-                
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=task_card,
-                    parse_mode="Markdown"
-                )
-                
-                # Отправим уведомление
-                bot.answer_callback_query(
-                    call.id, 
-                    text=notification_text, 
-                    show_alert=True
-                )
-            else:
-                # Ограничиваем длину сообщения об ошибке до 200 символов
-                error_text = f"❌ Ошибка: {message_text}"
-                if len(error_text) > 200:
-                    error_text = error_text[:197] + "..."
                     
-                bot.answer_callback_query(
-                    call.id, 
-                    text=error_text, 
-                    show_alert=True
-                )
-        
-        elif action == "review":
-            # Проверяем, назначена ли задача текущему пользователю и находится ли она на ревью
-            if task.assigned_to != user_id or not task.in_review:
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text="❌ *Ошибка*\n\nВы не можете выполнить задачу, которая не назначена на вас или не находится на ревью.",
-                    parse_mode="Markdown"
-                )
-                bot.answer_callback_query(call.id, text="Невозможно выполнить операцию.")
-                return
+                    bot.edit_message_text(
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id,
+                        text=task_card,
+                        parse_mode="Markdown"
+                    )
+                    
+                    # Отправим уведомление
+                    bot.answer_callback_query(
+                        call.id, 
+                        text=notification_text, 
+                        show_alert=True
+                    )
+                else:
+                    # Ограничиваем длину сообщения об ошибке до 200 символов
+                    error_text = f"❌ Ошибка: {message_text}"
+                    if len(error_text) > 200:
+                        error_text = error_text[:197] + "..."
+                        
+                    bot.answer_callback_query(
+                        call.id, 
+                        text=error_text, 
+                        show_alert=True
+                    )
             
-            # Пытаемся отметить задачу как выполненную через API
-            success, message_text = complete_task(task_id)
-            
-            if success:
-                # Синхронизируем статус с API
-                try:
-                    sync_task_status(task_id, user_id)
-                except Exception as e:
-                    logger.error(f"Ошибка синхронизации статуса: {e}")
+            elif action == "review":
+                # Проверяем, назначена ли задача текущему пользователю и находится ли она на ревью
+                if task.assigned_to != user_id or not task.in_review:
+                    bot.edit_message_text(
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id,
+                        text="❌ *Ошибка*\n\nВы не можете выполнить задачу, которая не назначена на вас или не находится на ревью.",
+                        parse_mode="Markdown"
+                    )
+                    bot.answer_callback_query(call.id, text="Невозможно выполнить операцию.")
+                    return
                 
-                # Отмечаем задачу как выполненную в локальном хранилище
-                task.completed = True
-                task.in_review = False
+                # Пытаемся отметить задачу как выполненную через API
+                success, message_text = complete_task(task_id)
                 
-                # Получаем статус "Выполнена" (код 3)
-                status_info = get_task_status_from_code(3)
-                status_text = status_info["text"]
-                status_emoji = status_info["emoji"]
-                
-                # Обновляем отображение задачи у всех пользователей
-                update_task_for_all_users(task_id, completed=True, in_review=False)
-                
-                # Показываем обновленную карточку задачи пользователю
-                task_card = f"""
+                if success:
+                    # Синхронизируем статус с API
+                    try:
+                        sync_task_status(task_id, user_id)
+                    except Exception as e:
+                        logger.error(f"Ошибка синхронизации статуса: {e}")
+                    
+                    # Отмечаем задачу как выполненную в локальном хранилище
+                    task.completed = True
+                    task.in_review = False
+                    
+                    # Получаем статус "Выполнена" (код 3)
+                    status_info = get_task_status_from_code(3)
+                    status_text = status_info["text"]
+                    status_emoji = status_info["emoji"]
+                    
+                    # Обновляем отображение задачи у всех пользователей
+                    update_task_for_all_users(task_id, completed=True, in_review=False)
+                    
+                    # Показываем обновленную карточку задачи пользователю
+                    task_card = f"""
 🔹 *{task.title}*
 {task.text}
 
@@ -1033,33 +1085,34 @@ def button_handler(call):
 🏷️ Статус: *{status_emoji} {status_text}*
 👤 Выполнена вами
 """
-                
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=task_card,
-                    parse_mode="Markdown"
-                )
-                
-                # Отправим уведомление об успешном выполнении задачи
-                bot.answer_callback_query(
-                    call.id, 
-                    text="🎉 Задача успешно выполнена после ревью!", 
-                    show_alert=True
-                )
-            else:
-                # Ограничиваем длину сообщения об ошибке до 200 символов
-                error_text = f"❌ Ошибка: {message_text}"
-                if len(error_text) > 200:
-                    error_text = error_text[:197] + "..."
                     
-                bot.answer_callback_query(
-                    call.id, 
-                    text=error_text, 
-                    show_alert=True
-                )
-    
-    bot.answer_callback_query(call.id)
+                    bot.edit_message_text(
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id,
+                        text=task_card,
+                        parse_mode="Markdown"
+                    )
+                    
+                    # Отправим уведомление об успешном выполнении задачи
+                    bot.answer_callback_query(
+                        call.id, 
+                        text="🎉 Задача успешно выполнена после ревью!", 
+                        show_alert=True
+                    )
+                else:
+                    # Ограничиваем длину сообщения об ошибке до 200 символов
+                    error_text = f"❌ Ошибка: {message_text}"
+                    if len(error_text) > 200:
+                        error_text = error_text[:197] + "..."
+                        
+                    bot.answer_callback_query(
+                        call.id, 
+                        text=error_text, 
+                        show_alert=True
+                    )
+    except Exception as e:
+        logger.error(f"Ошибка обработки callback_query: {e}")
+        bot.answer_callback_query(call.id, text="Произошла ошибка при обработке запроса. Пожалуйста, попробуйте еще раз.", show_alert=True)
 
 # Обработчик для всех остальных сообщений
 @bot.message_handler(func=lambda message: True)
@@ -1576,6 +1629,30 @@ def update_task_for_all_users(task_id, assigned_to=None, completed=False, in_rev
     
     except Exception as e:
         logger.error(f"Ошибка при обновлении отображения задачи: {e}")
+
+# Функция для обновления отдела пользователя через API
+def update_worker_department(telegram_id, department_id):
+    try:
+        # Формируем URL API для обновления работника
+        url = f"{API_BASE_URL}/workers/{telegram_id}/department"
+        
+        # Формируем правильные данные для API - объект JSON с полем department
+        data = {"department": department_id}
+        
+        # Отправляем запрос к API
+        logger.info(f"Отправка запроса на обновление отдела пользователя {telegram_id}: {department_id}")
+        response = requests.put(url, json=data, headers={"Content-Type": "application/json"})
+        
+        # Проверяем результат
+        if response.status_code in [200, 204]:
+            logger.info(f"Отдел пользователя успешно обновлен: {telegram_id} -> {department_id}")
+            return True
+        else:
+            logger.error(f"Ошибка обновления отдела пользователя {telegram_id}: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        logger.error(f"Исключение при обновлении отдела пользователя {telegram_id}: {e}")
+        return False
 
 if __name__ == "__main__":
     # Start Kafka consumer in a separate thread
